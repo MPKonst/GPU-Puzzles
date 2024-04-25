@@ -1,0 +1,14 @@
+name: gpu_puzzles
+channels:
+  - defaults
+  - conda-forge
+dependencies:
+  - python=3.12
+  - numpy
+  - numba
+  - pandas
+  - matplotlib
+  - pip
+  - pip:
+    - git+https://github.com/chalk-diagrams/planar
+    - git+https://github.com/danoneata/chalk@srush-patch-1

@@ -1,14 +1,17 @@
 from dataclasses import dataclass
 import numpy as np
-from chalk import *
+from chalk import (
+    concat, rectangle, text, hcat, vcat, circle, arc_between, empty, place_at, vstrut, hstrut, image
+)
+from chalk.transform import unit_y, P2, V2
+from chalk.core import set_svg_height
 from colour import Color
 import chalk
-from dataclasses import dataclass
 from typing import List, Any
 from collections import Counter
-from numba import cuda
 import numba
 import random
+from typing import Tuple
 
 @dataclass
 class ScalarHistory:
@@ -53,14 +56,14 @@ class Table:
         self.incoming = []
         self.array = array
 
-        self.size = array.shape
+        self.shape = array.shape
     
     def __getitem__(self, index):
         self.array[index]
         if isinstance(index, int):
             index = (index,)
-        assert len(index) == len(self.size), "Wrong number of indices"
-        if index[0] >= self.size[0]:
+        assert len(index) == len(self.shape), "Wrong number of indices"
+        if index[0] >= self.shape[0]:
             assert False, "bad size"
 
         return Scalar((self.name,) + index)
@@ -69,8 +72,8 @@ class Table:
         self.array[index]
         if isinstance(index, int):
             index = (index,)
-        assert len(index) == len(self.size), "Wrong number of indices"
-        if index[0] >= self.size[0]:
+        assert len(index) == len(self.shape), "Wrong number of indices"
+        if index[0] >= self.shape[0]:
             assert False, "bad size"
         if isinstance(val, Scalar):
             val = ScalarHistory("id", [val])
@@ -207,10 +210,10 @@ def myconnect(diagram, loc, color, con, name1, name2):
 
 def draw_table(tab):
     t = text(tab.name, 0.5).fill_color(black).line_width(0.0)
-    if len(tab.size) == 1:
-        tab = table(tab.name, 0, *tab.size)
+    if len(tab.shape) == 1:
+        tab = table(tab.name, 0, *tab.shape)
     else:
-        tab = table(tab.name, *tab.size)
+        tab = table(tab.name, *tab.shape)
     tab = tab.line_width(0.05)
     return tab.beside((t + vstrut(0.5)), -unit_y)
 
