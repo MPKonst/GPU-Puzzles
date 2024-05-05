@@ -22,6 +22,8 @@ def flash_attn_forward_no_stabilisation_kernel_factory(cuda, tpb_x, hidden_dim):
     2) tpb_x < hidden_dim, so we have enough threads to compute the (tpb_x, tpb_x) matrix
     3) tpb_x determines the parallelisation over seqlen, so we can reduce it as much as we want, to the detriment of speed.
     """
+    half_tpb_x = (tpb_x + 1) // 2
+
     def flash_attn_forward_no_stabilisation_kernel(out, q, k, v):
         # this will be launched as a tpb_x x hidden_dim block with hidden_dim > tpb_x
         local_i = cuda.threadIdx.x
@@ -35,14 +37,14 @@ def flash_attn_forward_no_stabilisation_kernel_factory(cuda, tpb_x, hidden_dim):
         q_shared = cuda.shared.array((tpb_x, hidden_dim), numba.float32)
         k_shared = cuda.shared.array((tpb_x, hidden_dim), numba.float32)
         v_shared = cuda.shared.array((tpb_x, hidden_dim), numba.float32)
+        
+        # shared memory to store attention logits 
+        exp_qkT = cuda.shared.array((tpb_x, tpb_x), numba.float32)
+        rowsumexp_qkT = cuda.shared.array((tpb_x, half_tpb_x), numba.float32) # extra half_tpb_x for parallel scan
+        rowsumexp_for_my_row_up_to_now = 0.0
 
         # output initialised as 0
         out_ij = 0.0
-
-        exp_qkT = cuda.shared.array((tpb_x, tpb_x), numba.float32)
-        rowsumexp_qkT = cuda.shared.array((tpb_x, tpb_x), numba.float32) # extra tpb_x for parallel scan
-        rowsumexp_qkT[local_i, local_j] = 0.0
-        rowsumexp_for_my_row_up_to_now = 0.0
 
         # populate the queries
         if i < seqlen and j < hidden_dim:
@@ -66,15 +68,21 @@ def flash_attn_forward_no_stabilisation_kernel_factory(cuda, tpb_x, hidden_dim):
                     s_ij += q_shared[local_i, inner_idx] * k_shared[local_j, inner_idx]
                 exped_s_ij = math.exp(s_ij)
                 exp_qkT[local_i, local_j] = exped_s_ij
-                rowsumexp_qkT[local_i, local_j] = exped_s_ij
             cuda.syncthreads()
 
             # compute the rowsum in the n_queries x n_keys block with parallel scan
-            q = n_keys
+            half_n_keys = (n_keys + 1) // 2
+            if i < seqlen and local_j < half_n_keys:
+                pair_sum = exp_qkT[local_i, 2 * local_j]
+                next_ = 2 * local_j  + 1
+                if  next_ < n_keys:
+                    pair_sum += exp_qkT[local_i, next_]
+                rowsumexp_qkT[local_i, local_j] = pair_sum
+            q = half_n_keys
             power_of_two = 1
             while q:
                 if not local_j % (2 * power_of_two):
-                    if i < seqlen and local_j + power_of_two < n_keys:
+                    if i < seqlen and local_j + power_of_two < half_n_keys:
                         rowsumexp_qkT[local_i, local_j] = rowsumexp_qkT[local_i, local_j] + rowsumexp_qkT[local_i, local_j + power_of_two]
                 power_of_two *= 2
                 q = q // 2
