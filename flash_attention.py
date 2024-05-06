@@ -218,7 +218,8 @@ def flash_attn_forward_kernel_factory(cuda, tpb_x, hidden_dim):
                     out_ij = out_ij * rescaling_factor + o_ij
             
             # we can finally update the running maximum
-            rowmax_for_my_row_up_to_now = new_rowmax
+            if i < seqlen:
+                rowmax_for_my_row_up_to_now = new_rowmax
                         
         if i < seqlen and j < hidden_dim:
             out[i, j] = out_ij / rowsumexp_for_my_row_up_to_now
