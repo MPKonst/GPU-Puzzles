@@ -27,6 +27,10 @@ def attn_spec(q, k, v):
 SEQ_LEN = 9
 HIDDEN_DIM = 10
 TPB_x = 5
+
+SEQ_LEN = 5
+HIDDEN_DIM = 6
+TPB_x = 2
 # np.random.seed(78)
 q = np.random.randn(SEQ_LEN, HIDDEN_DIM).astype(np.float32) * np.random.rand()
 k = np.random.randn(SEQ_LEN, HIDDEN_DIM).astype(np.float32) * np.random.rand()
@@ -35,7 +39,7 @@ v = np.random.randn(SEQ_LEN, HIDDEN_DIM).astype(np.float32) * np.random.rand()
 final_out = np.zeros((SEQ_LEN, HIDDEN_DIM))
 
 problem = CudaProblem(
-    "Flash Attn",
+    "Flash Attention",
     partial(kernel_to_visualise, tpb_x=TPB_x, hidden_dim=HIDDEN_DIM),
     inputs=[q, k, v],
     out=final_out,
@@ -45,5 +49,5 @@ problem = CudaProblem(
     input_names=["q", "k", "v"],
 )
 problem.show(
-    sparse=False, svg_height_factor=10
+    sparse=False, svg_height_factor=5
 )

@@ -96,7 +96,7 @@ def flash_attn_forward_no_stabilisation_kernel_factory(cuda, tpb_x, hidden_dim):
     return flash_attn_forward_no_stabilisation_kernel
 
 
-def flash_attn_forward_kernel_factory(cuda, tpb_x, hidden_dim):
+def flash_attn_forward_kernel_with_parallel_scan_factory(cuda, tpb_x, hidden_dim):
     """
     Assumptions: 
     1) The kernel will be launched on a block_size (tpb_x, hidden_dim) on a grid size (?, 1)
@@ -104,7 +104,7 @@ def flash_attn_forward_kernel_factory(cuda, tpb_x, hidden_dim):
     3) tpb_x determines the parallelisation over seqlen, so we can reduce it as much as we want, to the detriment of speed.
     """
     half_tpb_x = (tpb_x + 1) // 2
-    def flash_attn_forward_kernel(out, q, k, v):
+    def flash_attn_forward_kernel_with_parallel_scan(out, q, k, v):
         # this will be launched as a tpb_x x hidden_dim block with hidden_dim > tpb_x
         local_i = cuda.threadIdx.x
         local_j = cuda.threadIdx.y
@@ -228,77 +228,190 @@ def flash_attn_forward_kernel_factory(cuda, tpb_x, hidden_dim):
         if i < seqlen and j < hidden_dim:
             out[i, j] = out_ij / rowsumexp_for_my_row_up_to_now
 
+    return flash_attn_forward_kernel_with_parallel_scan
+
+def flash_attn_forward_kernel_factory(cuda, tpb_x, hidden_dim):
+    """
+    Assumptions: 
+    1) The kernel will be launched on a block_size (tpb_x, hidden_dim) on a grid size (?, 1)
+    2) tpb_x < hidden_dim, so we have enough threads to compute the product (tpb_x, hidden_dim) x (hidden_dim, tpb_x) matrix
+    3) tpb_x determines the parallelisation over seqlen, so we can reduce it as much as we want, to the detriment of speed.
+    """
+    def flash_attn_forward_kernel(out, q, k, v):
+        # this will be launched as a tpb_x x hidden_dim block with hidden_dim > tpb_x
+        local_i = cuda.threadIdx.x
+        local_j = cuda.threadIdx.y
+        i = cuda.blockIdx.x * cuda.blockDim.x + local_i
+        j = cuda.blockIdx.y * cuda.blockDim.y + local_j
+        seqlen = q.shape[0]
+
+        # we assume that hidden_dim is small enough that this can be loaded
+        # into shared memory (we can reduce tpb_x, if not)
+        q_shared = cuda.shared.array((tpb_x, hidden_dim), numba.float32)
+        qkT_and_exp_qkT = cuda.shared.array((tpb_x, tpb_x), numba.float32)
+        k_shared = cuda.shared.array((tpb_x, hidden_dim), numba.float32)
+        v_shared = cuda.shared.array((tpb_x, hidden_dim), numba.float32)
+
+        # output initialised as 0
+        out_ij = 0.0
+
+        rowsumexp_for_my_row_up_to_now = 0.0
+        rowmax_for_my_row_up_to_now = 0.0
+
+        # read-in the relevant block of queries
+        if i < seqlen and j < hidden_dim:
+            q_shared[local_i, local_j] = q[i, j]
+
+        num_tiles = (seqlen + tpb_x - 1) // tpb_x
+        for tile in range(num_tiles):
+            n_keys = tpb_x if tile != num_tiles - 1 else seqlen - (num_tiles - 1) * tpb_x
+            # load the next tile of keys and values
+            row_to_read = local_i + tile * tpb_x
+            if row_to_read < seqlen and j < hidden_dim:
+                k_shared[local_i, local_j] = k[row_to_read, j]
+                v_shared[local_i, local_j] = v[row_to_read, j]
+            cuda.syncthreads()
+
+            # compute this tile of q@k.T
+            if i < seqlen and local_j < n_keys:
+                s_ij = 0.0
+                for inner_idx in range(hidden_dim):
+                    s_ij += q_shared[local_i, inner_idx] * k_shared[local_j, inner_idx]
+                qkT_and_exp_qkT[local_i, local_j] = s_ij
+            cuda.syncthreads()
+
+            # compute the rowmax
+            new_rowmax = qkT_and_exp_qkT[local_i, 0]
+            if i < seqlen:
+                for key in range(1, n_keys):
+                    new_rowmax = max(new_rowmax, qkT_and_exp_qkT[local_i, key])
+                if tile == 0:
+                    rowmax_for_my_row_up_to_now = new_rowmax
+                else:
+                    new_rowmax = max(rowmax_for_my_row_up_to_now, new_rowmax)
+                    rescaling_factor = math.exp(rowmax_for_my_row_up_to_now - new_rowmax)
+
+            # exponentiate the attention weights
+            if i < seqlen and local_j < n_keys:
+                qkT_and_exp_qkT[local_i, local_j] = math.exp(s_ij - new_rowmax)
+
+            # compute the rowsum in the n_queries x n_keys block
+            new_rowsumexp = 0.0
+            if i < seqlen:
+                for key in range(n_keys):
+                    new_rowsumexp = (
+                        new_rowsumexp + qkT_and_exp_qkT[local_i, key]
+                    )
+                # update the running rowsumexp (don't forget the rescaling factor)
+                if tile == 0:
+                    rowsumexp_for_my_row_up_to_now = new_rowsumexp
+                else:
+                    rowsumexp_for_my_row_up_to_now = (
+                        rowsumexp_for_my_row_up_to_now * rescaling_factor
+                        + new_rowsumexp
+                    )
+
+            # compute exp_qkT @ V
+            if i < seqlen:
+                o_ij = 0.0
+                for inner_idx in range(n_keys):
+                    o_ij += qkT_and_exp_qkT[local_i, inner_idx] * v_shared[inner_idx, local_j]
+                # collect the output
+                if tile == 0:
+                    out_ij = o_ij
+                else:
+                    out_ij = out_ij * rescaling_factor + o_ij
+            
+            # we can finally update the running maximum
+            if i < seqlen:
+                rowmax_for_my_row_up_to_now = new_rowmax
+                        
+        if i < seqlen:
+            out[i, j] = out_ij / rowsumexp_for_my_row_up_to_now
+
     return flash_attn_forward_kernel
 
-def softmax(x, axis=-1):
-    e_x = np.exp(x - np.max(x, axis=axis, keepdims=True))
-    return e_x / e_x.sum(axis=axis, keepdims=True)
 
 
-def test_flash_attn_without_stabilisation():
-    """In flash_attn, we assume that TPB_y >= hidden dim"""
 
-    SEQ_LEN = 14
-    HIDDEN_DIM = 4
-    TPB_x = 3
-    divider = 10
-    np.random.seed(78)
-    q = np.random.randn(SEQ_LEN, HIDDEN_DIM).astype(np.float32) * np.random.rand() / divider
-    k = np.random.randn(SEQ_LEN, HIDDEN_DIM).astype(np.float32) * np.random.rand() / divider
-    v = np.random.randn(SEQ_LEN, HIDDEN_DIM).astype(np.float32) * np.random.rand() / divider
-
-    # k = np.arange(SEQ_LEN * HIDDEN_DIM).reshape(SEQ_LEN, HIDDEN_DIM).astype(np.float32) / divider
-    # v = np.arange(SEQ_LEN * HIDDEN_DIM).reshape(SEQ_LEN, HIDDEN_DIM).astype(np.float32) / divider
-    # q = np.arange(SEQ_LEN * HIDDEN_DIM).reshape(SEQ_LEN, HIDDEN_DIM).astype(np.float32) / divider
-
-    flash_attn_forward_no_stabilisation_kernel = flash_attn_forward_no_stabilisation_kernel_factory(
-        cuda, tpb_x=TPB_x, hidden_dim=HIDDEN_DIM
-    )
-
-    final_out = np.zeros((SEQ_LEN, HIDDEN_DIM))
-
-    jitted_kernel = numba.cuda.jit(flash_attn_forward_no_stabilisation_kernel)[
-        ((SEQ_LEN + TPB_x - 1) // TPB_x, 1),
-        (TPB_x, HIDDEN_DIM)
-    ]
-    
-    jitted_kernel(final_out, q, k, v)
-
-    np.testing.assert_allclose(softmax(q@k.T, axis=-1)@v, final_out, rtol=1e-4)
-    # print(final_out)
-    # print(softmax(q@k.T, axis=-1)@v)
-
-
-def test_flash_attn():
-    """In flash_attn, we assume that TPB_y >= hidden dim"""
-
-    SEQ_LEN = 300
-    HIDDEN_DIM = 128
-    TPB_x = 2
-    # np.random.seed(78)
-    q = np.random.randn(SEQ_LEN, HIDDEN_DIM).astype(np.float32) * np.random.rand()
-    k = np.random.randn(SEQ_LEN, HIDDEN_DIM).astype(np.float32) * np.random.rand()
-    v = np.random.randn(SEQ_LEN, HIDDEN_DIM).astype(np.float32) * np.random.rand()
-
-    # k = np.arange(SEQ_LEN * HIDDEN_DIM).reshape(SEQ_LEN, HIDDEN_DIM).astype(np.float32) 
-    # v = np.arange(SEQ_LEN * HIDDEN_DIM).reshape(SEQ_LEN, HIDDEN_DIM).astype(np.float32) 
-    # q = np.arange(SEQ_LEN * HIDDEN_DIM).reshape(SEQ_LEN, HIDDEN_DIM).astype(np.float32) 
-
-    flash_attn_forward_kernel = flash_attn_forward_kernel_factory(
-        cuda, tpb_x=TPB_x, hidden_dim=HIDDEN_DIM
-    )
-
-    final_out = np.zeros((SEQ_LEN, HIDDEN_DIM))
-
-    jitted_kernel = numba.cuda.jit(flash_attn_forward_kernel)[
-        ((SEQ_LEN + TPB_x - 1) // TPB_x, 1),
-        (TPB_x, HIDDEN_DIM)
-    ]
-    
-    jitted_kernel(final_out, q, k, v)
-
-    np.testing.assert_allclose(softmax(q@k.T, axis=-1)@v, final_out, rtol=1e-4)
 
 if __name__ == "__main__":
+    def softmax(x, axis=-1):
+        e_x = np.exp(x - np.max(x, axis=axis, keepdims=True))
+        return e_x / e_x.sum(axis=axis, keepdims=True)
+
+
+    def test_flash_attn_without_stabilisation():
+        """In flash_attn, we assume that TPB_y >= hidden dim"""
+
+        SEQ_LEN = 14
+        HIDDEN_DIM = 4
+        TPB_x = 3
+        divider = 10
+        np.random.seed(78)
+        q = np.random.randn(SEQ_LEN, HIDDEN_DIM).astype(np.float32) * np.random.rand() / divider
+        k = np.random.randn(SEQ_LEN, HIDDEN_DIM).astype(np.float32) * np.random.rand() / divider
+        v = np.random.randn(SEQ_LEN, HIDDEN_DIM).astype(np.float32) * np.random.rand() / divider
+
+        # k = np.arange(SEQ_LEN * HIDDEN_DIM).reshape(SEQ_LEN, HIDDEN_DIM).astype(np.float32) / divider
+        # v = np.arange(SEQ_LEN * HIDDEN_DIM).reshape(SEQ_LEN, HIDDEN_DIM).astype(np.float32) / divider
+        # q = np.arange(SEQ_LEN * HIDDEN_DIM).reshape(SEQ_LEN, HIDDEN_DIM).astype(np.float32) / divider
+
+        flash_attn_forward_no_stabilisation_kernel = flash_attn_forward_no_stabilisation_kernel_factory(
+            cuda, tpb_x=TPB_x, hidden_dim=HIDDEN_DIM
+        )
+
+        final_out = np.zeros((SEQ_LEN, HIDDEN_DIM))
+
+        jitted_kernel = numba.cuda.jit(flash_attn_forward_no_stabilisation_kernel)[
+            ((SEQ_LEN + TPB_x - 1) // TPB_x, 1),
+            (TPB_x, HIDDEN_DIM)
+        ]
+        
+        jitted_kernel(final_out, q, k, v)
+
+        np.testing.assert_allclose(softmax(q@k.T, axis=-1)@v, final_out, rtol=1e-4)
+        # print(final_out)
+        # print(softmax(q@k.T, axis=-1)@v)
+
+
+    def test_flash_attn():
+        """In flash_attn, we assume that TPB_y >= hidden dim"""
+
+        SEQ_LEN = 300
+        HIDDEN_DIM = 128
+        TPB_x = 2
+        # np.random.seed(78)
+        q = np.random.randn(SEQ_LEN, HIDDEN_DIM).astype(np.float32) * np.random.rand()
+        k = np.random.randn(SEQ_LEN, HIDDEN_DIM).astype(np.float32) * np.random.rand()
+        v = np.random.randn(SEQ_LEN, HIDDEN_DIM).astype(np.float32) * np.random.rand()
+
+        # k = np.arange(SEQ_LEN * HIDDEN_DIM).reshape(SEQ_LEN, HIDDEN_DIM).astype(np.float32) 
+        # v = np.arange(SEQ_LEN * HIDDEN_DIM).reshape(SEQ_LEN, HIDDEN_DIM).astype(np.float32) 
+        # q = np.arange(SEQ_LEN * HIDDEN_DIM).reshape(SEQ_LEN, HIDDEN_DIM).astype(np.float32) 
+
+        flash_attn_forward_kernel = flash_attn_forward_kernel_factory(
+            cuda, tpb_x=TPB_x, hidden_dim=HIDDEN_DIM
+        )
+
+        final_out = np.zeros((SEQ_LEN, HIDDEN_DIM))
+
+        jitted_kernel = numba.cuda.jit(flash_attn_forward_kernel)[
+            ((SEQ_LEN + TPB_x - 1) // TPB_x, 1),
+            (TPB_x, HIDDEN_DIM)
+        ]
+        
+        jitted_kernel(final_out, q, k, v)
+
+        np.testing.assert_allclose(softmax(q@k.T, axis=-1)@v, final_out, rtol=1e-4)
+
     test_flash_attn_without_stabilisation()
     test_flash_attn()
+
+
+            # # compute the rowsum in the n_queries x n_keys block with parallel scan
+            # if i < seqlen:
+            #     for key in range(n_keys):
+            #         rowsumexp_for_my_row_up_to_now = (
+            #             rowsumexp_for_my_row_up_to_now + exp_qkT[local_i, key]
+            #         )
