@@ -68,8 +68,9 @@ def flash_attn_forward_no_stabilisation_kernel_factory(cuda, tpb_x, hidden_dim):
                 pair_sum = exp_qkT[local_i, 2 * local_j]
                 next_ = 2 * local_j  + 1
                 if  next_ < n_keys:
-                    pair_sum += exp_qkT[local_i, next_]
+                    pair_sum = pair_sum + exp_qkT[local_i, next_]
                 rowsumexp_qkT[local_i, local_j] = pair_sum
+            cuda.syncthreads()
             q = half_n_keys
             power_of_two = 1
             while q:
@@ -88,7 +89,6 @@ def flash_attn_forward_no_stabilisation_kernel_factory(cuda, tpb_x, hidden_dim):
                 for inner_idx in range(n_keys):
                     out_ij += exp_qkT[local_i, inner_idx] * v_shared[inner_idx, local_j]
 
-        cuda.syncthreads()
         if i < seqlen and j < hidden_dim:
             out[i, j] = out_ij / rowsumexp_for_my_row_up_to_now
 
@@ -114,6 +114,11 @@ def flash_attn_forward_kernel_factory(cuda, tpb_x, hidden_dim):
         # we assume that hidden_dim is small enough that this can be loaded
         # into shared memory (we can reduce tpb_x, if not)
         q_shared = cuda.shared.array((tpb_x, hidden_dim), numba.float32)
+        qkT_and_exp_qkT = cuda.shared.array((tpb_x, tpb_x), numba.float32)
+        # extra half_tpb_x for parallel scan
+        rowmax_qkT = cuda.shared.array((tpb_x, half_tpb_x), numba.float32)
+        # extra half_tpb_x for parallel scan
+        rowsumexp_qkT = cuda.shared.array((tpb_x, half_tpb_x), numba.float32) 
         k_shared = cuda.shared.array((tpb_x, hidden_dim), numba.float32)
         v_shared = cuda.shared.array((tpb_x, hidden_dim), numba.float32)
 
@@ -121,18 +126,14 @@ def flash_attn_forward_kernel_factory(cuda, tpb_x, hidden_dim):
         out_ij = 0.0
 
         # some more shared memory to hold intermediate rowsumexp
-        qkT_and_exp_qkT = cuda.shared.array((tpb_x, tpb_x), numba.float32)
-        rowsumexp_qkT = cuda.shared.array((tpb_x, half_tpb_x), numba.float32) # extra half_tpb_x for parallel scan
         rowsumexp_for_my_row_up_to_now = 0.0
 
         # some more shared memory to hold the rowmax
-        rowmax_qkT = cuda.shared.array((tpb_x, half_tpb_x), numba.float32) # extra half_tpb_x for parallel scan
         rowmax_for_my_row_up_to_now = 0.0
 
         # read-in the relevant block of queries
         if i < seqlen and j < hidden_dim:
             q_shared[local_i, local_j] = q[i, j]
-        cuda.syncthreads()
 
         num_tiles = (seqlen + tpb_x - 1) // tpb_x
         for tile in range(num_tiles):
@@ -160,6 +161,7 @@ def flash_attn_forward_kernel_factory(cuda, tpb_x, hidden_dim):
                 if next_ < n_keys:
                     pair_max = max(pair_max, qkT_and_exp_qkT[local_i, next_])
                 rowmax_qkT[local_i, local_j] = pair_max
+            cuda.syncthreads()
             q = half_n_keys
             power_of_two = 1
             while q:
@@ -185,6 +187,7 @@ def flash_attn_forward_kernel_factory(cuda, tpb_x, hidden_dim):
                 if next_ < n_keys:
                     pair_sum = pair_sum + qkT_and_exp_qkT[local_i, next_]
                 rowsumexp_qkT[local_i, local_j] = pair_sum
+            cuda.syncthreads()
             q = half_n_keys
             power_of_two = 1
             while q:
