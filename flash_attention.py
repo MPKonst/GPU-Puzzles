@@ -29,10 +29,11 @@ def flash_attn_forward_no_stabilisation_kernel_factory(cuda, tpb_x, hidden_dim):
         q_shared = cuda.shared.array((tpb_x, hidden_dim), numba.float32)
         k_shared = cuda.shared.array((tpb_x, hidden_dim), numba.float32)
         v_shared = cuda.shared.array((tpb_x, hidden_dim), numba.float32)
-        
-        # shared memory to store attention logits 
+
+        # shared memory to store attention logits
         exp_qkT = cuda.shared.array((tpb_x, tpb_x), numba.float32)
-        rowsumexp_qkT = cuda.shared.array((tpb_x, half_tpb_x), numba.float32) # extra half_tpb_x for parallel scan
+        # extra half_tpb_x for parallel scan
+        rowsumexp_qkT = cuda.shared.array((tpb_x, half_tpb_x), numba.float32) 
         rowsumexp_for_my_row_up_to_now = 0.0
 
         # output initialised as 0
@@ -80,7 +81,7 @@ def flash_attn_forward_no_stabilisation_kernel_factory(cuda, tpb_x, hidden_dim):
                 power_of_two *= 2
                 q = q // 2
                 cuda.syncthreads()
-            
+
             # update the rowsumexp
             rowsumexp_for_my_row_up_to_now += rowsumexp_qkT[local_i, 0]
 
@@ -115,9 +116,11 @@ def flash_attn_forward_kernel_factory(cuda, tpb_x, hidden_dim):
         # into shared memory (we can reduce tpb_x, if not)
         q_shared = cuda.shared.array((tpb_x, hidden_dim), numba.float32)
         qkT_and_exp_qkT = cuda.shared.array((tpb_x, tpb_x), numba.float32)
-        # extra half_tpb_x for parallel scan
+        # some more shared memory to hold the rowmax
+        # -- extra half_tpb_x for parallel scan
         rowmax_qkT = cuda.shared.array((tpb_x, half_tpb_x), numba.float32)
-        # extra half_tpb_x for parallel scan
+        # some more shared memory to hold intermediate rowsumexp
+        # -- extra half_tpb_x for parallel scan
         rowsumexp_qkT = cuda.shared.array((tpb_x, half_tpb_x), numba.float32) 
         k_shared = cuda.shared.array((tpb_x, hidden_dim), numba.float32)
         v_shared = cuda.shared.array((tpb_x, hidden_dim), numba.float32)
@@ -125,10 +128,8 @@ def flash_attn_forward_kernel_factory(cuda, tpb_x, hidden_dim):
         # output initialised as 0
         out_ij = 0.0
 
-        # some more shared memory to hold intermediate rowsumexp
         rowsumexp_for_my_row_up_to_now = 0.0
 
-        # some more shared memory to hold the rowmax
         rowmax_for_my_row_up_to_now = 0.0
 
         # read-in the relevant block of queries
@@ -301,4 +302,3 @@ def test_flash_attn():
 if __name__ == "__main__":
     test_flash_attn_without_stabilisation()
     test_flash_attn()
-
