@@ -482,11 +482,11 @@ class CudaProblem:
             colors=None, #colors,
         )
     
-    def check(self):
+    def check(self, atol=0, rtol=1e-7):
         x = self.run_cuda()
         y = self.spec(*self.inputs)
         try:
-            np.testing.assert_allclose(x, y)
+            np.testing.assert_allclose(x, y, atol=atol, rtol=rtol)
             print("Passed Tests!")
             from IPython.display import HTML
             pups = [
