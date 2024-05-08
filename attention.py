@@ -276,7 +276,7 @@ def matmul_viz():
         threadsperblock=Coord(TPB, TPB),
         spec=None,
     )
-    problem.show(sparse=True)
+    problem.show(sparse=True, svg_height_factor=5)
 
 #----------------------------------Plotting row-wise sum------------------:
 def rowwise_sum_viz():
