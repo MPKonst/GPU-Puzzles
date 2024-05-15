@@ -1,13 +1,6 @@
-from PIL import Image
-import chalk
 import numpy as np
-import os
-import numba
-from numba import cuda # for some reason, this import is necessary, otherwise numba.cuda.jit is not found
-import math
 from functools import partial
 
-import io
 from lib import CudaProblem, Coord
 from flash_attention import (
     flash_attn_forward_kernel_factory,
