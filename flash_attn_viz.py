@@ -10,10 +10,12 @@ from functools import partial
 import io
 from lib import CudaProblem, Coord
 from flash_attention import (
-    flash_attn_forward_kernel_factory, flash_attn_forward_no_stabilisation_kernel_factory
+    flash_attn_forward_kernel_factory,
+    flash_attn_forward_no_stabilisation_kernel_factory,
+    flash_attn_forward_with_parallel_scan_kernel_factory
 )
 
-kernel_to_visualise = flash_attn_forward_kernel_factory
+kernel_to_visualise = flash_attn_forward_with_parallel_scan_kernel_factory
 
 
 def softmax(x, axis=-1):
@@ -28,9 +30,9 @@ SEQ_LEN = 9
 HIDDEN_DIM = 10
 TPB_x = 5
 
-SEQ_LEN = 5
-HIDDEN_DIM = 6
-TPB_x = 2
+# SEQ_LEN = 5
+# HIDDEN_DIM = 6
+# TPB_x = 2
 # np.random.seed(78)
 q = np.random.randn(SEQ_LEN, HIDDEN_DIM).astype(np.float32) * np.random.rand()
 k = np.random.randn(SEQ_LEN, HIDDEN_DIM).astype(np.float32) * np.random.rand()

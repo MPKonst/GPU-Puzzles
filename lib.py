@@ -350,7 +350,6 @@ def draw_results(
             dia = dia + concat(
                 draw_connect(tab, dia, loc, color, lines) for tab in all_tables
             )
-        height = dia.get_envelope().height
 
         # Label block and surround
         dia = hstrut(1) | (label(dia, f"Block {block.x} {block.y}")) | hstrut(1)
@@ -465,12 +464,13 @@ class CudaProblem:
     
     def show(self, sparse=False, svg_height_factor=50):
         results = self.run_python()
-        # print(reduce(int.__mul__, self.threadsperblock.tuple()))
         self.score(results)
-        colors = Color("red").range_to(
-            Color("blue"),
-            100, #reduce(int.__mul__, self.threadsperblock.tuple())
-        )
+        colors = [
+            *Color("red").range_to(
+                Color("blue"),
+                reduce(int.__mul__, self.threadsperblock.tuple())
+            )
+        ]
         return draw_results(
             results,
             self.name,
@@ -479,7 +479,7 @@ class CudaProblem:
             sparse,
             svg_height=500,
             svg_height_factor=svg_height_factor,
-            colors=None, #colors,
+            colors=colors,
         )
     
     def check(self, atol=0, rtol=1e-7):

@@ -1,4 +1,3 @@
-import os
 from numba import cuda
 import numba
 import numpy as np
@@ -11,8 +10,8 @@ def flash_attn_forward_no_stabilisation_kernel_factory(cuda, tpb_x, hidden_dim):
     """
     Assumptions: 
     1) The kernel will be launched on a block_size (tpb_x, hidden_dim) on a grid size (?, 1)
-    2) tpb_x < hidden_dim, so we have enough threads to compute the (tpb_x, tpb_x) matrix
-    3) tpb_x determines the parallelisation over seqlen, so we can reduce it as much as we want, to the detriment of speed.
+    2) tpb_x < hidden_dim, so we have enough threads to compute the matrix 
+       product (tpb_x, hidden_dim) x (hidden_dim, tpb_x)
     """
     half_tpb_x = (tpb_x + 1) // 2
 
@@ -96,15 +95,15 @@ def flash_attn_forward_no_stabilisation_kernel_factory(cuda, tpb_x, hidden_dim):
     return flash_attn_forward_no_stabilisation_kernel
 
 
-def flash_attn_forward_kernel_with_parallel_scan_factory(cuda, tpb_x, hidden_dim):
+def flash_attn_forward_with_parallel_scan_kernel_factory(cuda, tpb_x, hidden_dim):
     """
     Assumptions: 
     1) The kernel will be launched on a block_size (tpb_x, hidden_dim) on a grid size (?, 1)
-    2) tpb_x < hidden_dim, so we have enough threads to compute the product (tpb_x, hidden_dim) x (hidden_dim, tpb_x) matrix
-    3) tpb_x determines the parallelisation over seqlen, so we can reduce it as much as we want, to the detriment of speed.
+    2) tpb_x < hidden_dim, so we have enough threads to compute the matrix 
+       product (tpb_x, hidden_dim) x (hidden_dim, tpb_x)
     """
     half_tpb_x = (tpb_x + 1) // 2
-    def flash_attn_forward_kernel_with_parallel_scan(out, q, k, v):
+    def flash_attn_forward_with_parallel_scan_kernel(out, q, k, v):
         # this will be launched as a tpb_x x hidden_dim block with hidden_dim > tpb_x
         local_i = cuda.threadIdx.x
         local_j = cuda.threadIdx.y
@@ -228,14 +227,14 @@ def flash_attn_forward_kernel_with_parallel_scan_factory(cuda, tpb_x, hidden_dim
         if i < seqlen and j < hidden_dim:
             out[i, j] = out_ij / rowsumexp_for_my_row_up_to_now
 
-    return flash_attn_forward_kernel_with_parallel_scan
+    return flash_attn_forward_with_parallel_scan_kernel
 
 def flash_attn_forward_kernel_factory(cuda, tpb_x, hidden_dim):
     """
     Assumptions: 
     1) The kernel will be launched on a block_size (tpb_x, hidden_dim) on a grid size (?, 1)
-    2) tpb_x < hidden_dim, so we have enough threads to compute the product (tpb_x, hidden_dim) x (hidden_dim, tpb_x) matrix
-    3) tpb_x determines the parallelisation over seqlen, so we can reduce it as much as we want, to the detriment of speed.
+    2) tpb_x < hidden_dim, so we have enough threads to compute the matrix 
+       product (tpb_x, hidden_dim) x (hidden_dim, tpb_x)
     """
     def flash_attn_forward_kernel(out, q, k, v):
         # this will be launched as a tpb_x x hidden_dim block with hidden_dim > tpb_x
@@ -342,7 +341,6 @@ if __name__ == "__main__":
 
 
     def test_flash_attn_without_stabilisation():
-        """In flash_attn, we assume that TPB_y >= hidden dim"""
 
         SEQ_LEN = 14
         HIDDEN_DIM = 4
